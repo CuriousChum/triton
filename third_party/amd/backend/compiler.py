@@ -17,6 +17,11 @@ def min_dot_size(target: GPUTarget):
     return lambda lhsType, rhsType: (1, 1, 1)
 
 
+def is_pingpong_enabled(arch):
+    default = "1" if arch == "gfx942" else "0"
+    return os.getenv("TRITON_HIP_USE_BLOCK_PINGPONG", default) == "1"
+
+
 @dataclass(frozen=True)
 class HIPOptions:
     num_warps: int = 4
@@ -65,6 +70,12 @@ class HIPOptions:
         # Ignore user-defined warp size for gfx9
         warp_size = 32 if 'gfx10' in self.arch or 'gfx11' in self.arch or 'gfx12' in self.arch else 64
         object.__setattr__(self, 'warp_size', warp_size)
+        # Error out if max threads per block is exceeded.
+        # This is theoretically architecture specific but in reality they are all 1024.
+        max_threads = 1024
+        assert self.num_warps * warp_size <= max_threads, \
+                f"{self.num_warps} warps * {warp_size} warp size" \
+                f" must not exceed the max threads per block limit ({max_threads})"
         # Only kpack=1 is supported on gfx950
         kpack = 1 if self.arch == 'gfx950' else self.kpack
         object.__setattr__(self, 'kpack', kpack)
@@ -102,8 +113,10 @@ class HIPBackend(BaseBackend):
 
         if "supported_fp8_dtypes" not in opts:
             supported_fp8_dtypes = set(HIPOptions.supported_fp8_dtypes)
-            if self.target.arch in ('gfx940', 'gfx941', 'gfx942', 'gfx950'):
+            if self.target.arch in ('gfx940', 'gfx941', 'gfx942'):
                 supported_fp8_dtypes.update({'fp8e4nv', 'fp8e4b8', 'fp8e5b16'})
+            elif self.target.arch in ('gfx950'):
+                supported_fp8_dtypes.update({'fp8e4nv', 'fp8e5'})
             args["supported_fp8_dtypes"] = tuple(sorted(supported_fp8_dtypes))
 
         if "enable_fp_fusion" not in opts:
@@ -127,17 +140,26 @@ class HIPBackend(BaseBackend):
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         from triton.language.extra.hip import libdevice
+
         return {"triton.language.extra.libdevice": libdevice}
 
     def load_dialects(self, ctx):
         amd.load_dialects(ctx)
 
     @staticmethod
+    @functools.lru_cache()
+    def use_buffer_ops():
+        return os.environ.get("AMDGCN_USE_BUFFER_OPS", "1") == "1"
+
+    @staticmethod
     def is_within_2gb(arg):
+        import torch
+
+        MAX_INT_32 = 2**31 - 1
         if hasattr(arg, "ptr_range"):
-            return arg.ptr_range() <= 2**31 - 1
-        if "torch.Tensor" in str(type(arg)) and hasattr(arg, "untyped_storage"):
-            return arg.untyped_storage().size() <= 2**31 - 1
+            return arg.ptr_range() <= MAX_INT_32
+        if isinstance(arg, torch.Tensor) and hasattr(arg, "untyped_storage"):
+            return arg.untyped_storage().size() <= MAX_INT_32
         return False
 
     @staticmethod
@@ -150,7 +172,9 @@ class HIPBackend(BaseBackend):
     @staticmethod
     def get_arg_specialization(arg, ty, **kwargs):
         ret = BaseBackend.get_arg_specialization(arg, ty, **kwargs)
-        if ty == "tensor" and HIPBackend.is_within_2gb(arg):
+        # Only attempt to do buffer ops specialization if buffer ops are enabled.
+        # Otherwise the is_within_2gb check is unnecessary overhead.
+        if HIPBackend.use_buffer_ops() and ty == "tensor" and HIPBackend.is_within_2gb(arg):
             ret += "S"
         return ret
 
@@ -184,7 +208,7 @@ class HIPBackend(BaseBackend):
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
-        passes.common.add_licm(pm)
+        passes.ttir.add_triton_licm(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
         pm.run(mod)
@@ -206,6 +230,12 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_remove_layout_conversions(pm)
         amd.passes.ttgpuir.add_optimize_epilogue(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, True)
+        amd.passes.ttgpuir.add_hoist_layout_conversions(pm)
+
+        passes.ttgpuir.add_fuse_nested_loops(pm)
+        passes.common.add_canonicalizer(pm)
+        passes.ttir.add_triton_licm(pm)
+        passes.common.add_canonicalizer(pm)
 
         global_prefetch = int(os.getenv("TRITON_HIP_GLOBAL_PREFETCH", "0"))
         local_prefetch = int(os.getenv("TRITON_HIP_LOCAL_PREFETCH", "0"))
@@ -227,14 +257,16 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_optimize_dot_operands(pm, True)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
+        if os.environ.get("TRITON_HIP_USE_IN_THREAD_TRANSPOSE", "0") == "1":
+            amd.passes.ttgpuir.add_in_thread_transpose(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm)
         if amd.has_matrix_core_feature(options.arch):
             amd.passes.ttgpuir.add_reorder_instructions(pm)
-            use_block_pingpong = os.getenv("TRITON_HIP_USE_BLOCK_PINGPONG", "0") == "1"
+            use_block_pingpong = is_pingpong_enabled(options.arch)
             if use_block_pingpong and options.num_stages == 2:
-                amd.passes.ttgpuir.add_block_pingpong(pm)
+                amd.passes.ttgpuir.add_block_pingpong(pm, options.num_stages)
 
-        use_buffer_ops = os.environ.get("AMDGCN_USE_BUFFER_OPS", "0") == "1"
-        if use_buffer_ops:
+        if HIPBackend.use_buffer_ops():
             amd.passes.ttgpuir.add_canonicalize_pointers(pm)
             passes.common.add_canonicalizer(pm)
             amd.passes.ttgpuir.add_convert_to_buffer_ops(pm, options.arch)
@@ -250,7 +282,6 @@ class HIPBackend(BaseBackend):
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
-        amd.passes.ttgpuir.add_decompose_unsupported_conversions(pm, options.arch)
         # custom_lds_size is an experimental parameter that defines amount of LDS available
         # for one thread block. Measured in bytes.
         #

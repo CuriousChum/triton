@@ -38,32 +38,6 @@ static constexpr bool disableLDAcquireLowering = false;
 
 namespace {
 
-llvm::MapVector<StringAttr, int32_t> getAllFreeVarMasks(MLIRContext *ctx) {
-  // Mask where all elements are redundant
-  auto kReg = str_attr("reg");
-  auto kLane = str_attr("lane");
-  auto kWarp = str_attr("warp");
-  auto kBlock = str_attr("block");
-
-  int32_t fullMask = -1;
-  llvm::MapVector<StringAttr, int32_t> ret;
-  for (auto dimName : {kReg, kLane, kWarp, kBlock}) {
-    ret[dimName] = fullMask;
-  }
-  return ret;
-}
-
-llvm::MapVector<StringAttr, int32_t> getFreeVariableMasks(Type type) {
-  auto ctx = type.getContext();
-  auto tensorTy = dyn_cast<RankedTensorType>(type);
-  if (!tensorTy) {
-    return getAllFreeVarMasks(ctx);
-  }
-
-  auto ll = ttg::toLinearLayout(tensorTy.getShape(), tensorTy.getEncoding());
-  return ll.getFreeVariableMasks();
-}
-
 Value maybeAnd(RewriterBase &rewriter, Location loc, Value a, Value b) {
   auto tb = TritonLLVMOpBuilder(loc, rewriter);
   if (a && b) {
@@ -85,9 +59,8 @@ Value emitRedundantThreadPredicate(
   auto kWarp = str_attr("warp");
   auto kBlock = str_attr("block");
 
-  int warpSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(moduleOp);
   Value zero = b.i32_val(0);
-  auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc, warpSize);
+  auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
   Value blockId = freeVarMasks.lookup(kBlock) == 0
                       ? zero
                       : targetInfo.getClusterCTAId(rewriter, loc);
@@ -103,10 +76,6 @@ Value emitRedundantThreadPredicate(
     }
   }
   return pred;
-}
-
-bool isCanonicalIndex(unsigned index, unsigned freeVarMask) {
-  return (index & freeVarMask) == 0;
 }
 
 unsigned getCanonicalIndex(unsigned index, unsigned freeVarMask) {
@@ -140,7 +109,7 @@ struct LoadStoreConversionBase {
     auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
     if (!tensorTy)
       return 1;
-    return axisAnalysisPass.getPtrContiguity(ptr);
+    return axisAnalysisPass.getContiguity(ptr);
   }
 
   unsigned getVectorSize(Value ptr) const {
@@ -1045,8 +1014,6 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto dstTy = op.getResult().getType();
     auto resElemTy = getTypeConverter()->convertType(dstTy.getElementType());
     auto srcLayout = srcTy.getEncoding();
-    assert((isa<BlockedEncodingAttr, SliceEncodingAttr>(srcLayout) &&
-            "Unexpected srcLayout in AsyncCopyGlobalToLocalOpConversion"));
 
     Value llDst = adaptor.getResult();
     Value llSrc = adaptor.getSrc();
@@ -1209,13 +1176,18 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     // figure out that the op is uniform.
     pred = b.and_(pred, LLVM::NVIDIA::createElectPredicate(loc, rewriter));
 
+    Attribute encoding = op.getResult().getType().getEncoding();
+    auto mmaEncoding = dyn_cast_or_null<NVMMASharedEncodingAttr>(encoding);
     int elementSizeInBytes =
         op.getResult().getType().getElementType().getIntOrFloatBitWidth() / 8;
-    int totalNumElements = product(op.getResult().getType().getShape());
+    int packingFactor = (mmaEncoding && mmaEncoding.getFp4Padded()) ? 2 : 1;
+    int totalNumElements =
+        product(op.getResult().getType().getShape()) * packingFactor;
     int64_t size = totalNumElements * elementSizeInBytes;
 
     int innerBlockSize = op.getResult().getType().getShape().back();
-    int contigDimSizeInByte = innerBlockSize * elementSizeInBytes;
+    int contigDimSizeInByte =
+        innerBlockSize * elementSizeInBytes * packingFactor;
     int numCopies = 1;
     int rank = op.getCoord().size();
     if (rank > 1)

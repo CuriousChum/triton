@@ -318,14 +318,14 @@ bool DotOp::verifyDims() {
 
 //-- DotScaledOp --
 bool DotScaledOp::verifyDims() {
-  auto aShape = this->getLhs().getType().getShape();
-  auto bShape = this->getRhs().getType().getShape();
+  auto aShape = this->getA().getType().getShape();
+  auto bShape = this->getB().getType().getShape();
 
   auto aKdim = aShape[aShape.size() - 1];
   auto bKdim = bShape[aShape.size() - 2];
-  if (this->getLhsType() == ScaleDotElemType::E2M1)
+  if (this->getAElemType() == ScaleDotElemType::E2M1)
     aKdim *= 2;
-  if (this->getRhsType() == ScaleDotElemType::E2M1)
+  if (this->getBElemType() == ScaleDotElemType::E2M1)
     bKdim *= 2;
 
   return aKdim == bKdim;
@@ -826,6 +826,38 @@ LogicalResult FpToFpOp::verify() {
   return success();
 }
 
+//-- BitcastOp --
+LogicalResult BitcastOp::verify() {
+  // Bitcast only allows conversion between types with the same bit width.
+  Type dstType = getType();
+  Type srcType = getSrc().getType();
+  // Strip tensor shapes; SameOperandsAndResultShape guarantees shapes match.
+  if (auto dstTensorType = dyn_cast<RankedTensorType>(dstType))
+    dstType = dstTensorType.getElementType();
+  if (auto srcTensorType = dyn_cast<RankedTensorType>(srcType))
+    srcType = srcTensorType.getElementType();
+  bool dstIsPtr = isa<triton::PointerType>(dstType);
+  bool srcIsPtr = isa<triton::PointerType>(srcType);
+  if (dstIsPtr || srcIsPtr) {
+    // Bitcast supports pointer-to-pointer conversions but not
+    // pointer-to-scalar.
+    if (dstIsPtr && srcIsPtr) {
+      if (triton::getAddressSpace(dstType) != triton::getAddressSpace(srcType))
+        return emitError(
+            "Cannot bitcast pointer between different address spaces");
+      return success();
+    }
+    return emitError("Cannot bitcast pointer to non-pointer type");
+  }
+  unsigned dstBits = dstType.getIntOrFloatBitWidth();
+  unsigned srcBits = srcType.getIntOrFloatBitWidth();
+  if (dstBits != srcBits) {
+    return emitError("Cannot bitcast data-type of size ")
+           << srcBits << " to data-type of size " << dstBits;
+  }
+  return success();
+}
+
 //-- BroadcastOp --
 void BroadcastOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                               MLIRContext *context) {
@@ -882,7 +914,7 @@ void MakeTensorPtrOp::build(OpBuilder &builder, OperationState &state,
   auto tensorType = RankedTensorType::get(
       SmallVector<int64_t>(tensorShape.begin(), tensorShape.end()),
       pointerType.getPointeeType());
-  auto result = PointerType::get(tensorType, 1);
+  auto result = PointerType::get(tensorType, pointerType.getAddressSpace());
 
   return build(builder, state, result, base, shape, strides, offsets,
                builder.getDenseI32ArrayAttr(order));
@@ -1025,48 +1057,72 @@ LogicalResult ReturnOp::verify() {
 }
 
 // -- JoinOp --
-LogicalResult
-JoinOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
-                         ValueRange operands, DictionaryAttr attributes,
-                         OpaqueProperties properties, RegionRange regions,
-                         SmallVectorImpl<Type> &inferredReturnTypes) {
-  // These should have been checked by tablegen-generated code.
-  assert(operands.size() == 2);
-  assert(operands[0].getType() == operands[1].getType());
-  assert(isa<RankedTensorType>(operands[0].getType()));
-  assert(isa<RankedTensorType>(operands[1].getType()));
 
-  Value lhs = operands[0];
-  auto srcTy = cast<RankedTensorType>(lhs.getType());
-
-  SmallVector<int64_t> retShape(srcTy.getShape());
+void JoinOp::build(OpBuilder &builder, OperationState &state, Value lhs,
+                   Value rhs) {
+  auto lhsTy = cast<RankedTensorType>(lhs.getType());
+  SmallVector<int64_t> retShape(lhsTy.getShape());
   retShape.push_back(2);
 
-  Attribute srcEnc = srcTy.getEncoding();
+  Attribute srcEnc = lhsTy.getEncoding();
   Attribute retEnc;
   if (srcEnc) {
     if (cast<DialectInferLayoutInterface>(&srcEnc.getDialect())
-            ->inferJoinOpEncoding(srcEnc, retEnc, srcTy.getShape(), location)
+            ->inferDefaultJoinOpEncoding(srcEnc, retEnc, lhsTy.getShape(),
+                                         /*loc=*/std::nullopt)
             .failed()) {
-      return failure();
+      assert(false && "failed to infer join encoding");
     }
   }
-  inferredReturnTypes.push_back(
-      RankedTensorType::get(retShape, srcTy.getElementType(), retEnc));
+  auto retTy = RankedTensorType::get(retShape, lhsTy.getElementType(), retEnc);
+  JoinOp::build(builder, state, retTy, lhs, rhs);
+}
+
+LogicalResult JoinOp::verify() {
+  RankedTensorType srcTy = getLhs().getType();
+  SmallVector<int64_t> retShape(srcTy.getShape());
+  retShape.push_back(2);
+
+  RankedTensorType retTy = getType();
+  if (SmallVector<int64_t>(retTy.getShape()) != retShape) {
+    return emitOpError("result shape must be (")
+           << retShape << "), but got " << retTy.getShape();
+  }
+  if (retTy.getElementType() != srcTy.getElementType()) {
+    return emitOpError("result element type must match the input element type");
+  }
+  Attribute retEnc = retTy.getEncoding();
+  if (!retEnc) {
+    if (srcTy.getEncoding()) {
+      return emitOpError("result encoding must be specified");
+    }
+    return success();
+  }
+  // There are multiple correct destination layout for a given source layout but
+  // there is only one correct source layout for a given destination layout. So
+  // we verify that the source layout match the destination layout.
+  Attribute srcEnc;
+  Location location = getLoc();
+  if (cast<DialectInferLayoutInterface>(&retEnc.getDialect())
+          ->inferSplitOpEncoding(retEnc, srcEnc, retShape, location)
+          .failed()) {
+    return failure();
+  }
+
+  if (cast<triton::DialectInferLayoutInterface>(&srcEnc.getDialect())
+          ->verifyLayoutsAreEqual(srcTy.getShape(), srcEnc, srcTy.getEncoding(),
+                                  {})
+          .failed()) {
+    return emitOpError("incompatible join layout");
+  }
   return success();
 }
 
 // -- SplitOp --
 LogicalResult SplitOp::inferReturnTypes(
-    MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
-    SmallVectorImpl<Type> &inferredReturnTypes) {
-  // These should have been checked by tablegen-generated code.
-  assert(operands.size() == 1);
-  assert(isa<RankedTensorType>(operands[0].getType()));
-
-  Value src = operands[0];
-  auto srcTy = cast<RankedTensorType>(src.getType());
+    MLIRContext *context, std::optional<Location> location,
+    SplitOp::Adaptor adaptor, SmallVectorImpl<Type> &inferredReturnTypes) {
+  auto srcTy = cast<RankedTensorType>(adaptor.getSrc().getType());
   auto srcShape = srcTy.getShape();
 
   if (srcShape.empty() || srcShape.back() != 2) {
@@ -1188,10 +1244,9 @@ LogicalResult GatherOp::inferReturnTypes(
   return success();
 }
 
-// -- ExperimentalDescriptorGatherOp
-LogicalResult
-ExperimentalDescriptorGatherOp::verifyResultType(Operation *op,
-                                                 mlir::ShapedType type) {
+// -- DescriptorGatherOp
+LogicalResult DescriptorGatherOp::verifyResultType(Operation *op,
+                                                   mlir::ShapedType type) {
   if (type.getRank() != 2)
     return op->emitOpError("result must be a 2D tensor, but got ") << type;
 
@@ -1218,7 +1273,7 @@ ExperimentalDescriptorGatherOp::verifyResultType(Operation *op,
   return success();
 }
 
-LogicalResult ExperimentalDescriptorGatherOp::verify() {
+LogicalResult DescriptorGatherOp::verify() {
   RankedTensorType blockType = getDesc().getType().getBlockType();
   // Gather from `!tt.tensordesc<tensor<1xMxdtype>>`.
   if (blockType.getRank() != 2)
@@ -1253,7 +1308,7 @@ LogicalResult ExperimentalDescriptorGatherOp::verify() {
   return success();
 }
 
-// -- ExperimentalDesciptorLoadOp --
+// -- DescriptorLoadOp --
 static LogicalResult verifyDesciptorLoadStoreType(Operation *op,
                                                   TensorDescType desc,
                                                   RankedTensorType tensor) {
@@ -1276,12 +1331,12 @@ static LogicalResult verifyDesciptorLoadStoreType(Operation *op,
   return op->emitOpError("tensor desciptor block and tensor types must match");
 }
 
-LogicalResult ExperimentalDescriptorLoadOp::verify() {
+LogicalResult DescriptorLoadOp::verify() {
   return verifyDesciptorLoadStoreType(*this, getDesc().getType(), getType());
 }
 
-// -- ExperimentalDesciptorStoreOp --
-LogicalResult ExperimentalDescriptorStoreOp::verify() {
+// -- DescriptorStoreOp --
+LogicalResult DescriptorStoreOp::verify() {
   return verifyDesciptorLoadStoreType(*this, getDesc().getType(),
                                       getSrc().getType());
 }

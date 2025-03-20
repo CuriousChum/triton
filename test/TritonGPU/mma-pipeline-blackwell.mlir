@@ -5,10 +5,12 @@
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked3 =  #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
+#blocked4 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, unpacked = true>
 #tmem1 = #ttng.tensor_memory_scales_encoding<>
+#tmem_scales = #ttng.tensor_memory_scales_encoding<>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LOWER-LABEL: @chained_dot_no_multibuf_acc
@@ -259,20 +261,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LOWER-LABEL: @do_not_pipeline_second_dot
-  // CHECK-LOWER: scf.for {{.*}}
-  // CHECK-LOWER:   ttng.tmem_store {{.*}} {triton.pipeline_stage = 0 : i32}
-  // CHECK-LOWER:   ttng.tc_gen5_mma {{.*}} {triton.pipeline_stage = 0 : i32}
-  // CHECK-LOWER:   ttng.tmem_load {{.*}} {triton.pipeline_stage = 1 : i32}
-  // CHECK-LOWER:   ttng.tmem_alloc
-  // CHECK-LOWER-NOT: triton.pipeline_stage
-  // CHECK-LOWER:   ttng.tc_gen5_mma
-  // CHECK-LOWER-NOT: triton.pipeline_stage
-  // CHECK-LOWER:   ttng.tmem_load
+  // CHECK-LOWER-LABEL: @do_not_pipeline_two_dots
   // CHECK-LOWER-NOT: triton.pipeline_stage
 
-  // CHECK-LABEL: @do_not_pipeline_second_dot
-  tt.func public @do_not_pipeline_second_dot(%A_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1>, %B_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1>, %acc_ptr: tensor<128x128x!tt.ptr<f32>, #blocked>, %res_ptr: tensor<128x128x!tt.ptr<f32>, #blocked>, %arg3: i32) attributes {noinline = false} {
+  // CHECK-LABEL: @do_not_pipeline_two_dots
+  tt.func public @do_not_pipeline_two_dots(%A_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1>, %B_ptr: tensor<128x128x!tt.ptr<f16>, #blocked1>, %acc_ptr: tensor<128x128x!tt.ptr<f32>, #blocked>, %res_ptr: tensor<128x128x!tt.ptr<f32>, #blocked>, %arg3: i32) attributes {noinline = false} {
     %true = arith.constant true
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
     %c0_i32 = arith.constant 0 : i32
@@ -419,7 +412,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %A_sh = ttg.memdesc_subview %A_multibuf[%c0_i32, %c0_i32, %c0_i32] : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
       %B = tt.load %B_ptr : tensor<128x128x!tt.ptr<f16>, #blocked1>
       %B_sh = ttg.memdesc_subview %B_multibuf[%c0_i32, %c0_i32, %c0_i32] : !ttg.memdesc<1x128x128xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
-      %acc_tm = ttng.tmem_alloc  : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %acc_tm = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       ttng.tc_gen5_mma %A_sh, %B_sh, %acc_tm, %false, %true : (!ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, i1, i1) -> ()
       %acc_res = ttng.tmem_load %acc_tm : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
       tt.store %res_ptr, %acc_res : tensor<128x128x!tt.ptr<f32>, #blocked>
@@ -788,7 +781,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: ttng.tmem_store %[[CST]], %[[TMEM]], %[[TRUE]]
 
   // Barrier allocation:
-  // CHECK: %[[BAR_SH:.*]] = ttg.local_alloc  : () -> !ttg.memdesc<2xi64
+  // CHECK: %[[BAR_SH:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2xi64
   // CHECK: %[[BAR_SLICE0:.*]] = ttg.memdesc_subview %[[BAR_SH]][%[[C0]]]
   // CHECK: ttng.init_barrier %[[BAR_SLICE0]], 1
   // CHECK: %[[BAR_SLICE1:.*]] = ttg.memdesc_subview %[[BAR_SH]][%[[C1]]]
@@ -828,8 +821,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c0_i32 = arith.constant 0 : i32
     %true = arith.constant true
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked1>
-    %1 = ttg.local_alloc  : () -> !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable>
-    %2 = ttg.local_alloc  : () -> !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %1 = ttg.local_alloc : () -> !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %2 = ttg.local_alloc : () -> !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable>
     %3 = arith.cmpi sgt, %arg0, %c0_i32 : i32
     %4 = ttg.memdesc_subview %1[%c0_i32, %c0_i32, %c0_i32] : !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
     %5 = tt.splat %3 : i1 -> tensor<128x128xi1, #blocked>
@@ -874,7 +867,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @pipeline_tc05mma_scaled
   // CHECK:   ttng.tc_gen5_mma_scaled
-  // CHECK-NOT:   ttng.wait_barrier // MMA pipeline should not apply since tmem_copy is not used
+  // MMA pipeline should not apply since scales are not passed in shmem
+  // CHECK-NOT:   ttng.wait_barrier
 
   tt.func public @pipeline_tc05mma_scaled(%arg0: i32, %arg1: tensor<128x128x!tt.ptr<f16>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %arg2: tensor<128x128x!tt.ptr<f16>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %scale_A: tensor<128x4x!tt.ptr<i8>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %scale_B: tensor<128x4x!tt.ptr<i8>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}) -> tensor<128x128xf32, #blocked1> attributes {noinline = false} {
     %c2_i32 = arith.constant 2 : i32
@@ -883,10 +877,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c0_i32 = arith.constant 0 : i32
     %true = arith.constant true
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked1>
-    %1 = ttg.local_alloc  : () -> !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable>
-    %2 = ttg.local_alloc  : () -> !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable>
-    %scale_A_SMEM = ttg.local_alloc  : () -> !ttg.memdesc<2x128x4xi8, #shared1, #ttg.shared_memory, mutable>
-    %scale_B_SMEM = ttg.local_alloc  : () -> !ttg.memdesc<2x128x4xi8, #shared1, #ttg.shared_memory, mutable>
+    %1 = ttg.local_alloc : () -> !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %2 = ttg.local_alloc : () -> !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %scale_A_SMEM = ttg.local_alloc : () -> !ttg.memdesc<2x128x4xi8, #shared1, #ttg.shared_memory, mutable>
+    %scale_B_SMEM = ttg.local_alloc : () -> !ttg.memdesc<2x128x4xi8, #shared1, #ttg.shared_memory, mutable>
     %3 = arith.cmpi sgt, %arg0, %c0_i32 : i32
     %4 = ttg.memdesc_subview %1[%c0_i32, %c0_i32, %c0_i32] : !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
     %5 = tt.splat %3 : i1 -> tensor<128x128xi1, #blocked>
@@ -956,20 +950,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: @pipeline_tc05mma_scaled_tmem_copy
+  // CHECK-LABEL: @pipeline_tc05mma_scaled_shmem
   // CHECK:   ttng.wait_barrier
 
-  tt.func public @pipeline_tc05mma_scaled_tmem_copy(%arg0: i32, %arg1: tensor<128x128x!tt.ptr<f16>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %arg2: tensor<128x128x!tt.ptr<f16>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %scale_A: tensor<1x512x!tt.ptr<i8>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %scale_B: tensor<1x512x!tt.ptr<i8>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}) -> tensor<128x128xf32, #blocked1> attributes {noinline = false} {
+  tt.func public @pipeline_tc05mma_scaled_shmem(%arg0: i32, %arg1: tensor<128x128x!tt.ptr<f16>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %arg2: tensor<128x128x!tt.ptr<f16>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %scale_A: tensor<1x512x!tt.ptr<i8>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %scale_B: tensor<1x512x!tt.ptr<i8>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}) -> tensor<128x128xf32, #blocked1> attributes {noinline = false} {
     %c2_i32 = arith.constant 2 : i32
     %c-1_i32 = arith.constant -1 : i32
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
     %true = arith.constant true
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked1>
-    %1 = ttg.local_alloc  : () -> !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable>
-    %2 = ttg.local_alloc  : () -> !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable>
-    %scale_A_SMEM = ttg.local_alloc  : () -> !ttg.memdesc<2x1x512xi8, #shared1, #ttg.shared_memory, mutable>
-    %scale_B_SMEM = ttg.local_alloc  : () -> !ttg.memdesc<2x1x512xi8, #shared1, #ttg.shared_memory, mutable>
+    %cst_1 = arith.constant dense<127> : tensor<128x4xi8, #blocked4>
+    %1 = ttg.local_alloc : () -> !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %2 = ttg.local_alloc : () -> !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable>
+    %scale_A_SMEM = ttg.local_alloc : () -> !ttg.memdesc<2x1x512xi8, #shared1, #ttg.shared_memory, mutable>
+    %scale_B_SMEM = ttg.local_alloc : () -> !ttg.memdesc<2x1x512xi8, #shared1, #ttg.shared_memory, mutable>
     %3 = arith.cmpi sgt, %arg0, %c0_i32 : i32
     %4 = ttg.memdesc_subview %1[%c0_i32, %c0_i32, %c0_i32] : !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
     %5 = tt.splat %3 : i1 -> tensor<128x128xi1, #blocked>
@@ -999,14 +994,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %21 = ttg.async_wait %arg7 {num = 0 : i32}
       %22 = ttg.memdesc_subview %2[%19, %c0_i32, %c0_i32] : !ttg.memdesc<2x128x128xf16, #shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>
 
-      %127 = ttng.tmem_alloc  : () -> !ttg.memdesc<128x4xi8, #tmem1, #ttng.tensor_memory, mutable>
-      ttng.tmem_copy %arg8, %127,  : (!ttg.memdesc<1x512xi8, #shared1, #ttg.shared_memory, mutable>, !ttg.memdesc<128x4xi8, #tmem1, #ttng.tensor_memory, mutable>) -> ()
-      %128 = ttng.tmem_alloc  : () -> !ttg.memdesc<128x4xi8, #tmem1, #ttng.tensor_memory, mutable>
-      ttng.tmem_copy %arg9, %128,  : (!ttg.memdesc<1x512xi8, #shared1, #ttg.shared_memory, mutable>, !ttg.memdesc<128x4xi8, #tmem1, #ttng.tensor_memory, mutable>) -> ()
-
       %tmem = ttng.tmem_alloc %acc : (tensor<128x128xf32, #blocked1>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-
-      ttng.tc_gen5_mma_scaled %20, %22, %tmem, %127, %128, %true, %true lhs = e5m2 rhs = e5m2: (!ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x4xi8, #tmem1, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x4xi8, #tmem1, #ttng.tensor_memory, mutable>, i1, i1) -> ()
+      %cst_scale = ttng.tmem_alloc %cst_1 : (tensor<128x4xi8, #blocked4>) -> !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>
+      ttng.tc_gen5_mma_scaled %20, %22, %tmem, %arg8, %cst_scale, %true, %true lhs = e5m2 rhs = e5m2: (!ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x512xi8, #shared1, #ttg.shared_memory, mutable>, !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>, i1, i1) -> ()
       %acc_res = ttng.tmem_load %tmem : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked1>
       %23 = arith.addi %arg4, %c1_i32 : i32
       %24 = arith.cmpi slt, %23, %c2_i32 : i32

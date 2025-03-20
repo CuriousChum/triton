@@ -173,6 +173,25 @@ void WaitBarrierOp::getEffects(
                        mlir::triton::gpu::SharedMemory::get());
 }
 
+// -- ArriveBarrierOp --
+LogicalResult ArriveBarrierOp::verify() {
+  if (failed(verifyBarrierType(*this, getAlloc().getType())))
+    return failure();
+  if (getCount() < 1)
+    return emitOpError("count must be greater than or equal to 1");
+  return success();
+}
+
+void ArriveBarrierOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  // The arrive will increment the pending arrival count inside the barrier.
+  effects.emplace_back(MemoryEffects::Read::get(), &getAllocMutable(),
+                       mlir::triton::gpu::SharedMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getAllocMutable(),
+                       mlir::triton::gpu::SharedMemory::get());
+}
+
 // -- TensorDescToTMAPtrOp --
 LogicalResult TensorDescToTMAPtrOp::canonicalize(TensorDescToTMAPtrOp op,
                                                  PatternRewriter &rewriter) {
@@ -225,7 +244,7 @@ LogicalResult AsyncTMAGatherOp::verify() {
   triton::gpu::MemDescType resultType = getResult().getType();
   if (!resultType.getMutableMemory())
     return emitOpError("cannot store into immutable memory");
-  return ExperimentalDescriptorGatherOp::verifyResultType(*this, resultType);
+  return DescriptorGatherOp::verifyResultType(*this, resultType);
 }
 
 void AsyncTMAGatherOp::getEffects(
@@ -388,8 +407,26 @@ LogicalResult TMEMAllocOp::verify() {
   return success();
 }
 
-bool isDescendingOrder(triton::gpu::MemDescType type) {
-  auto order = triton::gpu::getOrder(type.getEncoding());
+void TMEMAllocOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  Operation *op = getOperation();
+  // If allocation is immutable, mark it as no side effect allow things like
+  // CSE, DCE to work in early compiler passes.
+  // After the memory offset is computed, we attach the true side effect to the
+  // op.
+  if (!getType().getMutableMemory() && !op->hasAttr("tensor_memory_col_offset"))
+    return;
+  effects.emplace_back(MemoryEffects::Allocate::get(),
+                       mlir::triton::nvidia_gpu::TensorMemory::get());
+  if (getSrc())
+    effects.emplace_back(MemoryEffects::Write::get(),
+                         getOperation()->getOpResult(0),
+                         mlir::triton::nvidia_gpu::TensorMemory::get());
+}
+
+static bool isDescendingOrder(triton::gpu::MemDescType type) {
+  auto order = triton::gpu::getOrder(type);
   auto rank = type.getRank();
   for (int i = 0; i < rank; ++i) {
     if (order[i] != rank - 1 - i)
@@ -431,6 +468,15 @@ LogicalResult TMEMCopyOp::verify() {
   // checking we can do here are limited. For simplicity, shape checking is
   // omitted.
   return success();
+}
+
+void TMEMCopyOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Write::get(),
+                       mlir::triton::nvidia_gpu::TensorMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getSrcMutable(),
+                       mlir::triton::gpu::SharedMemory::get());
 }
 
 } // namespace nvidia_gpu

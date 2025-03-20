@@ -302,8 +302,9 @@ std::string GraphLayoutMarker::getColor(const Type &type) const {
 // -------------------------------------------------------------------------- //
 
 static Attribute inferDstEncoding(triton::ReduceOp op, Attribute encoding) {
-  return triton::gpu::SliceEncodingAttr::get(op->getContext(), op.getAxis(),
-                                             encoding);
+  return triton::gpu::SliceEncodingAttr::get(
+      op->getContext(), op.getAxis(),
+      cast<ttg::DistributedEncodingTrait>(encoding));
 }
 
 static Attribute inferDstEncoding(triton::ExpandDimsOp op, Attribute encoding) {
@@ -317,11 +318,11 @@ static Attribute inferDstEncoding(triton::ExpandDimsOp op, Attribute encoding) {
 
 static Attribute inferDstEncoding(JoinOp op, Attribute srcEnc) {
   Attribute dstEnc;
-  auto shape = op.getResult().getType().getShape();
+  auto shape = op.getLhs().getType().getShape();
   if (srcEnc.getDialect()
           .getRegisteredInterface<DialectInferLayoutInterface>()
-          ->inferJoinOpEncoding(srcEnc, dstEnc, shape,
-                                /*loc=*/std::nullopt)
+          ->inferDefaultJoinOpEncoding(srcEnc, dstEnc, shape,
+                                       /*loc=*/std::nullopt)
           .succeeded()) {
     return dstEnc;
   }
@@ -351,8 +352,9 @@ static Attribute inferSrcEncoding(triton::ReduceOp op, Attribute encoding) {
 }
 
 static Attribute inferSrcEncoding(triton::ExpandDimsOp op, Attribute encoding) {
-  return triton::gpu::SliceEncodingAttr::get(op->getContext(), op.getAxis(),
-                                             encoding);
+  return triton::gpu::SliceEncodingAttr::get(
+      op->getContext(), op.getAxis(),
+      cast<ttg::DistributedEncodingTrait>(encoding));
 }
 
 static Attribute inferSrcEncoding(JoinOp op, Attribute dstEnc) {
@@ -371,10 +373,11 @@ static Attribute inferSrcEncoding(JoinOp op, Attribute dstEnc) {
 static Attribute inferSrcEncoding(SplitOp op, Attribute dstEnc) {
   // Join is the inverse of split.
   Attribute srcEnc;
-  auto shape = op.getSrc().getType().getShape();
+  auto shape = op.getOutLHS().getType().getShape();
   if (dstEnc.getDialect()
           .getRegisteredInterface<DialectInferLayoutInterface>()
-          ->inferJoinOpEncoding(dstEnc, srcEnc, shape, /*loc=*/std::nullopt)
+          ->inferDefaultJoinOpEncoding(dstEnc, srcEnc, shape,
+                                       /*loc=*/std::nullopt)
           .succeeded()) {
     return srcEnc;
   }
@@ -630,7 +633,7 @@ bool canFoldIntoConversion(Operation *op, Attribute targetEncoding) {
 }
 
 scf::ForOp replaceForOpWithNewSignature(
-    RewriterBase &rewriter, scf::ForOp loop, ValueRange newIterOperands,
+    OpBuilder &rewriter, scf::ForOp loop, ValueRange newIterOperands,
     SmallVectorImpl<std::tuple<Value, Value>> &replacements) {
   OpBuilder::InsertionGuard g(rewriter);
   rewriter.setInsertionPoint(loop);
@@ -654,19 +657,19 @@ scf::ForOp replaceForOpWithNewSignature(
   return newLoop;
 }
 
-scf::ForOp replaceForOpWithNewSignature(RewriterBase &rewriter, scf::ForOp loop,
+scf::ForOp replaceForOpWithNewSignature(OpBuilder &rewriter, scf::ForOp loop,
                                         ValueRange newIterOperands) {
   SmallVector<std::tuple<Value, Value>> replacements;
   auto newForOp = replaceForOpWithNewSignature(rewriter, loop, newIterOperands,
                                                replacements);
-  for (auto &kv : replacements) {
-    rewriter.replaceAllUsesWith(std::get<0>(kv), std::get<1>(kv));
+  for (auto [result, value] : replacements) {
+    result.replaceAllUsesWith(value);
   }
   return newForOp;
 }
 
 scf::WhileOp replaceWhileOpWithNewSignature(
-    RewriterBase &rewriter, scf::WhileOp loop, ValueRange newIterOperands,
+    OpBuilder &rewriter, scf::WhileOp loop, ValueRange newIterOperands,
     TypeRange newResultTypes,
     SmallVectorImpl<std::tuple<Value, Value>> &replacements) {
   OpBuilder::InsertionGuard g(rewriter);
@@ -705,11 +708,11 @@ scf::WhileOp replaceWhileOpWithNewSignature(
   for (auto [oldArg, newArg] : llvm::zip(
            loop.getBeforeArguments(), newLoop.getBeforeArguments().take_front(
                                           loop.getBeforeArguments().size())))
-    rewriter.replaceAllUsesWith(oldArg, newArg);
+    oldArg.replaceAllUsesWith(newArg);
   for (auto [oldArg, newArg] : llvm::zip(loop.getAfterArguments(),
                                          newLoop.getAfterArguments().take_front(
                                              loop.getAfterArguments().size())))
-    rewriter.replaceAllUsesWith(oldArg, newArg);
+    oldArg.replaceAllUsesWith(newArg);
 
   // Stack the new results
   for (auto it : llvm::zip(loop.getResults(), newLoop.getResults().take_front(
@@ -719,7 +722,7 @@ scf::WhileOp replaceWhileOpWithNewSignature(
   return newLoop;
 }
 
-scf::WhileOp replaceWhileOpWithNewSignature(RewriterBase &rewriter,
+scf::WhileOp replaceWhileOpWithNewSignature(OpBuilder &rewriter,
                                             scf::WhileOp loop,
                                             ValueRange newIterOperands,
                                             TypeRange newResultTypes) {
@@ -727,13 +730,13 @@ scf::WhileOp replaceWhileOpWithNewSignature(RewriterBase &rewriter,
   auto newWhileOp = replaceWhileOpWithNewSignature(
       rewriter, loop, newIterOperands, newResultTypes, replacements);
   for (auto &kv : replacements) {
-    rewriter.replaceAllUsesWith(std::get<0>(kv), std::get<1>(kv));
+    std::get<0>(kv).replaceAllUsesWith(std::get<1>(kv));
   }
   return newWhileOp;
 }
 
 scf::IfOp replaceIfOpWithNewSignature(
-    RewriterBase &rewriter, scf::IfOp ifOp, TypeRange newResultTypes,
+    OpBuilder &rewriter, scf::IfOp ifOp, TypeRange newResultTypes,
     SmallVectorImpl<std::tuple<Value, Value>> &replacements) {
   OpBuilder::InsertionGuard g(rewriter);
   rewriter.setInsertionPoint(ifOp);
@@ -766,13 +769,13 @@ void appendToForOpYield(scf::ForOp forOp, ArrayRef<Value> newOperands) {
   yieldOp->erase();
 }
 
-scf::IfOp replaceIfOpWithNewSignature(RewriterBase &rewriter, scf::IfOp ifOp,
+scf::IfOp replaceIfOpWithNewSignature(OpBuilder &rewriter, scf::IfOp ifOp,
                                       TypeRange newResultTypes) {
   SmallVector<std::tuple<Value, Value>> replacements;
   auto newIfOp =
       replaceIfOpWithNewSignature(rewriter, ifOp, newResultTypes, replacements);
   for (auto &kv : replacements)
-    rewriter.replaceAllUsesWith(std::get<0>(kv), std::get<1>(kv));
+    std::get<0>(kv).replaceAllUsesWith(std::get<1>(kv));
   return newIfOp;
 }
 
@@ -1030,46 +1033,6 @@ StringRef getAMDArch(Operation *module) {
   return ref.drop_front(4); // drop the "hip:"
 }
 
-// Rough utility for obtaining a SharedEnc for a LinearEncoding,
-// as we've replaced DotOpEnc with Linear in some cases
-// (specifically, fp4ToFp and similar unpack-upcast thru join)
-std::optional<ttg::SwizzledSharedEncodingAttr>
-getSharedForLinear(ttg::LinearEncodingAttr enc,
-                   ArrayRef<unsigned int> globalOrder, ArrayRef<int64_t> shape,
-                   unsigned elemBitWidth, ttg::CTALayoutAttr ctaLayout) {
-  auto ctx = enc.getContext();
-  auto ll = enc.getLinearLayout();
-  auto rank = shape.size();
-
-  if (rank != 2)
-    return std::nullopt;
-
-  auto order = enc.getOrder();
-  assert(globalOrder.size() == rank);
-  // TODO add memdesc_trans support for dot(trans(cvt(src) #linear) #dot_op)
-  if (order != globalOrder)
-    return std::nullopt;
-
-  auto innerDim = order[0];
-  auto outerDim = order[1];
-  auto contigPerWarp = enc.getContigPerWarp();
-
-  constexpr unsigned BANK_SIZE{128};
-  auto elemBytes = elemBitWidth / 8;
-
-  auto vec = contigPerWarp[innerDim];
-  auto rowSize = elemBytes * (unsigned)shape[innerDim];
-  auto perPhase = std::max(BANK_SIZE / rowSize, 1u);
-  auto maxPhase = std::max(contigPerWarp[outerDim] / perPhase, 1u);
-
-  // cp.async does not support transfer size < 4B
-  if (vec * elemBytes < 4 && perPhase < maxPhase)
-    return std::nullopt;
-
-  return ttg::SwizzledSharedEncodingAttr::get(ctx, vec, perPhase, maxPhase,
-                                              order, ctaLayout);
-}
-
 // If all the transitive uses of the given value have are used by a convert to
 // the same dot operand encoding, return the shared encoding that needs to be
 // used to be compatible with users' layouts. If there are incompatible shared
@@ -1096,28 +1059,18 @@ getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible) {
     } else {
       if (!isa<ttg::LocalLoadOp, ttg::ConvertLayoutOp>(user))
         return std::nullopt;
-      auto enc =
+      auto dotOpEnc = dyn_cast<ttg::DotOperandEncodingAttr>(
           cast<triton::gpu::TensorOrMemDesc>(user->getResult(0).getType())
-              .getEncoding();
-      auto srcTy = cast<triton::gpu::TensorOrMemDesc>(val.getType());
-      auto ctaLayout = ttg::getCTALayout(srcTy.getEncoding());
-      auto order = ttg::getOrder(srcTy.getEncoding());
-      unsigned bitWidth = srcTy.getElementType().getIntOrFloatBitWidth();
-
-      if (auto dotOpEnc = dyn_cast<ttg::DotOperandEncodingAttr>(enc)) {
-        tempAttr = ttg::SwizzledSharedEncodingAttr::get(
-            val.getContext(), dotOpEnc, srcTy.getShape(), order, ctaLayout,
-            bitWidth, /*needTrans=*/false);
-      } else if (auto linearEnc = dyn_cast<ttg::LinearEncodingAttr>(enc)) {
-
-        auto attrOpt = getSharedForLinear(linearEnc, order, srcTy.getShape(),
-                                          bitWidth, ctaLayout);
-        if (!attrOpt)
-          return std::nullopt;
-        tempAttr = *attrOpt;
-      } else {
+              .getEncoding());
+      if (!dotOpEnc)
         return std::nullopt;
-      }
+      auto srcTy = cast<triton::gpu::TensorOrMemDesc>(val.getType());
+      auto CTALayout = ttg::getCTALayout(srcTy.getEncoding());
+      auto order = getOrderForMemory(srcTy);
+      unsigned bitWidth = srcTy.getElementType().getIntOrFloatBitWidth();
+      tempAttr = ttg::SwizzledSharedEncodingAttr::get(
+          val.getContext(), dotOpEnc, srcTy.getShape(), order, CTALayout,
+          bitWidth, /*needTrans=*/false);
     }
     // Check that the shared encodings needed by the users are compatible.
     if (attr != nullptr && attr != tempAttr) {
@@ -1285,14 +1238,16 @@ ttg::LocalAllocOp findShmemAlloc(Value operand) {
       transitiveOperand = transitiveOperand.getDefiningOp()->getOperand(0);
     }
   }
-  if (auto subView =
-          dyn_cast<ttg::MemDescSubviewOp>(transitiveOperand.getDefiningOp())) {
+  if (auto subView = dyn_cast_or_null<ttg::MemDescSubviewOp>(
+          transitiveOperand.getDefiningOp())) {
     // Multi-buffered operand
-    return dyn_cast<ttg::LocalAllocOp>(subView.getSrc().getDefiningOp());
+    return dyn_cast_or_null<ttg::LocalAllocOp>(
+        subView.getSrc().getDefiningOp());
   } else {
     // Single bufferred operand that does not require a subview (not loaded in
     // the loop)
-    return dyn_cast<ttg::LocalAllocOp>(transitiveOperand.getDefiningOp());
+    return dyn_cast_or_null<ttg::LocalAllocOp>(
+        transitiveOperand.getDefiningOp());
   }
   return nullptr;
 }

@@ -2,6 +2,7 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -899,9 +900,19 @@ static void fuseOneLevel(LoopNestNode *parent, mlir::DominanceInfo &domInfo) {
     epilogueIf.erase();
   }
 
+  // Propagate the `tt.disallow_acc_multi_buffer` attribute to the parent loop.
+  bool disallowAccMultiBuffer = getDisallowAccMultiBuffer(outer);
+  for (scf::ForOp loop : innerLoops) {
+    disallowAccMultiBuffer |= getDisallowAccMultiBuffer(loop);
+  }
+  if (disallowAccMultiBuffer)
+    fused->setAttr(kDisallowAccMultiBufferAttrName, b.getUnitAttr());
+
   // Update the parent's loop to the fused loop. Set the new stage count to the
   // max stage count of the inner loops.
   int numStages = 1;
+  if (auto stageAttr = outer->getAttrOfType<IntegerAttr>(kNumStagesAttrName))
+    numStages = stageAttr.getInt();
   for (scf::ForOp loop : innerLoops) {
     if (auto stageAttr = loop->getAttrOfType<IntegerAttr>(kNumStagesAttrName))
       numStages = std::max<int>(numStages, stageAttr.getInt());
@@ -1053,6 +1064,7 @@ static LogicalResult preprocessLoopNest(const LoopNest &nest,
   scf::ForOp &outerLoop = nest.root->loop;
   scf::ForOp &innerLoop = nest.root->children.front()->loop;
 
+  moveLoopInvariantCode(outerLoop);
   optimizeEpilogueDependencies(outerLoop, innerLoop, domInfo);
   return speculateInnerLoopLength(outerLoop, innerLoop, domInfo);
 }
